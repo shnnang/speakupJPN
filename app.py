@@ -1,133 +1,188 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import asyncio
 import edge_tts
+import asyncio
 from io import BytesIO
+import base64
+import json
 
-st.set_page_config(page_title="日本語読み上げ（無料B優先）", page_icon="🗣️", layout="centered")
-st.title("🗣️ 日本語読み上げアプリ（無料：B優先 / A保険つき）")
-
-st.caption("B: edge-tts（高品質MP3生成・APIキー不要） / A: ブラウザTTS（保険）")
+st.set_page_config(page_title="読み上げ（B: edge-tts 単語ハイライト）", page_icon="🗣️", layout="centered")
+st.title("🗣️ 読み上げ（B: edge-tts）単語ハイライト + クリック再生")
 
 text = st.text_area("文章を貼り付け", height=220, placeholder="ここに日本語の文章を貼り付け…")
 
-with st.expander("⚙️ 音声設定（B: edge-tts）", expanded=True):
-    voice = st.selectbox(
-        "音声（おすすめ）",
-        [
-            "ja-JP-KeitaNeural",
-            "ja-JP-NanamiNeural",
-            "ja-JP-DaichiNeural",
-            "ja-JP-AoiNeural",
-        ],
-        index=0,
-        help="edge-tts は Microsoft Edge のオンラインTTSを使います（音声一覧は --list-voices で取得可能）。"
+# ====== 設定 ======
+voice = st.selectbox(
+    "音声",
+    ["ja-JP-KeitaNeural", "ja-JP-NanamiNeural", "ja-JP-DaichiNeural", "ja-JP-AoiNeural"],
+    index=0
+)
+
+col1, col2 = st.columns(2)
+gen_rate = col1.slider("生成時の話速（edge-tts rate %）", -50, 50, 0, 5)
+playback_rate = col2.slider("再生時の倍速（audio.playbackRate）", 0.5, 2.0, 1.0, 0.1)
+
+def fmt_rate(x: int) -> str:
+    return f"{x:+d}%"
+
+async def synthesize_word_boundary_async(txt: str, voice: str, rate_percent: int):
+    """
+    boundary="WordBoundary" にして stream() から audio と WordBoundary を拾う。
+    stream() が audio と WordBoundary を流す例が公式の例/ドキュメントにある。[1](https://gtts.readthedocs.io/en/latest/)[5](https://model.aibase.com/ja/models/details/1915692899666386945)
+    """
+    communicate = edge_tts.Communicate(
+        txt,
+        voice=voice,
+        rate=fmt_rate(rate_percent),
+        boundary="WordBoundary",  # 単語境界イベント[5](https://model.aibase.com/ja/models/details/1915692899666386945)[1](https://gtts.readthedocs.io/en/latest/)
     )
-    rate = st.slider("話速（%）", -50, 50, 0, 5)
-    pitch = st.slider("音の高さ（Hz）", -50, 50, 0, 5)
-    volume = st.slider("音量（%）", -50, 50, 0, 5)
 
-def _prosody(rate, pitch, volume):
-    # edge-tts の指定形式に整形（例: +10% / -5% / +5Hz）
-    r = f"{rate:+d}%"
-    v = f"{volume:+d}%"
-    p = f"{pitch:+d}Hz"
-    return r, v, p
+    audio_buf = BytesIO()
+    marks = []  # {offset, duration, text}
 
-async def synthesize_mp3_async(text: str, voice: str, rate: int, pitch: int, volume: int) -> bytes:
-    r, v, p = _prosody(rate, pitch, volume)
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=r, pitch=p, volume=v)
-    buf = BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
-            buf.write(chunk["data"])
-    return buf.getvalue()
+            audio_buf.write(chunk["data"])
+        elif chunk["type"] == "WordBoundary":
+            marks.append({
+                "offset": chunk["offset"],
+                "duration": chunk["duration"],
+                "text": (chunk.get("text") or "")
+            })
 
-def synthesize_mp3(text: str, voice: str, rate: int, pitch: int, volume: int) -> bytes:
-    # Streamlit内では asyncio.run が使えないケースがあるので安全側に寄せる
+    return audio_buf.getvalue(), marks
+
+def synthesize_word_boundary(txt: str, voice: str, rate_percent: int):
     try:
-        return asyncio.run(synthesize_mp3_async(text, voice, rate, pitch, volume))
+        return asyncio.run(synthesize_word_boundary_async(txt, voice, rate_percent))
     except RuntimeError:
-        # すでにイベントループが動いている環境向け
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(synthesize_mp3_async(text, voice, rate, pitch, volume))
+            return loop.run_until_complete(synthesize_word_boundary_async(txt, voice, rate_percent))
         finally:
             loop.close()
 
-st.divider()
+if st.button("🎧 生成して表示", type="primary"):
+    if not text.strip():
+        st.warning("文章を入力してね！")
+        st.stop()
 
-colB, colA = st.columns([1, 1])
+    with st.spinner("生成中…"):
+        mp3_bytes, marks = synthesize_word_boundary(text, voice, gen_rate)
 
-with colB:
-    st.subheader("B) 高品質（edge-tts）でMP3生成")
-    if st.button("🎧 生成して再生（B）", type="primary", use_container_width=True):
-        if not text.strip():
-            st.warning("文章を入力してね！")
-        else:
-            with st.spinner("音声を生成中…（数秒かかることがあります）"):
-                try:
-                    mp3_bytes = synthesize_mp3(text, voice, rate, pitch, volume)
-                    st.success("生成できました！")
-                    st.audio(mp3_bytes, format="audio/mp3")  # Streamlitのオーディオ再生 [7](https://docs.streamlit.io/develop/api-reference/media/st.audio)
-                    st.download_button(
-                        "⬇️ MP3をダウンロード",
-                        data=mp3_bytes,
-                        file_name="tts_ja.mp3",
-                        mime="audio/mpeg",
-                        use_container_width=True
-                    )
-                except Exception as e:
-                    st.error("Bで失敗しました。A（ブラウザ読み上げ）を試してください。")
-                    st.code(str(e))
+    # 音声を base64 にしてHTMLに埋め込み
+    b64_audio = base64.b64encode(mp3_bytes).decode("utf-8")
 
-with colA:
-    st.subheader("A) ブラウザで直接読み上げ（保険）")
-    st.caption("端末/ブラウザ依存。Bがダメな時の逃げ道。")
-    # Web Speech API で読み上げ（前回の簡易版）
+    # offset/duration は 100ns ticks → 秒へ変換: ticks / 10,000,000 [2](https://deepwiki.com/nateshmbhat/pyttsx3/2.2.1-sapi5-driver-%28windows%29)
+    cues = []
+    for m in marks:
+        t = (m["text"] or "").strip()
+        if not t:
+            continue
+        start = m["offset"] / 10_000_000
+        end = (m["offset"] + m["duration"]) / 10_000_000
+        cues.append({"start": start, "end": end, "text": t})
+
+    if not cues:
+        st.error("WordBoundaryが取得できませんでした（ネットワーク制限などの可能性）。")
+        st.stop()
+
+    cues_json = json.dumps(cues, ensure_ascii=False)
+
     html = f"""
-    <div style="display:flex; gap:10px; align-items:center;">
-      <button id="play" style="padding:8px 12px; border-radius:10px; border:1px solid #ddd; cursor:pointer;">▶️ 再生</button>
-      <button id="stop" style="padding:8px 12px; border-radius:10px; border:1px solid #ddd; cursor:pointer;">⏹ 停止</button>
-      <span id="status" style="font-size:12px; color:#666;"></span>
-    </div>
-    <script>
-    const text = `{text.replace("`","\\`")}`;
-    let utter = null;
-
-    function setStatus(msg) {{
-      document.getElementById("status").innerText = msg || "";
-    }}
-
-    function pickJaVoice() {{
-      const voices = window.speechSynthesis.getVoices();
-      return voices.find(v => (v.lang || "").toLowerCase().includes("ja")) || null;
-    }}
-
-    document.getElementById("play").onclick = () => {{
-      if (!text || text.trim().length === 0) {{
-        alert("文章を入力してください");
-        return;
+    <style>
+      .word {{
+        display:inline-block; padding:3px 6px; margin:3px 2px 0 0;
+        border-radius:10px; border:1px solid #e5e7eb; cursor:pointer;
+        font-size:14px; line-height:1.7; user-select:none;
       }}
-      window.speechSynthesis.cancel();
-      utter = new SpeechSynthesisUtterance(text);
-      const v = pickJaVoice();
-      if (v) utter.voice = v;
+      .word.active {{
+        background:#dbeafe; border-color:#60a5fa;
+        box-shadow:0 0 0 2px rgba(96,165,250,0.25);
+      }}
+      .toolbar {{ display:flex; gap:10px; align-items:center; margin:10px 0 8px; flex-wrap:wrap; }}
+      .btn {{
+        padding:6px 10px; border-radius:10px; border:1px solid #ddd; cursor:pointer; background:white;
+      }}
+      .muted {{ color:#6b7280; font-size:12px; }}
+      .panel {{ margin-top:10px; }}
+    </style>
 
-      utter.onstart = () => setStatus("読み上げ中…");
-      utter.onend = () => setStatus("完了");
-      utter.onerror = () => setStatus("エラー");
+    <div class="toolbar">
+      <button class="btn" id="play">▶️ 再生</button>
+      <button class="btn" id="pause">⏸ 一時停止</button>
+      <button class="btn" id="stop">⏹ 停止</button>
+      <span class="muted">再生速度: <b id="rateLabel">{playback_rate:.1f}x</b></span>
+      <span class="muted">（単語をクリックすると、そこから再生）</span>
+    </div>
 
-      window.speechSynthesis.speak(utter);
-    }};
+    <audio id="player" controls style="width:100%;">
+      data:audio/mpeg;base64,{b64_audio}
+    </audio>
 
-    document.getElementById("stop").onclick = () => {{
-      window.speechSynthesis.cancel();
-      setStatus("停止しました");
-    }};
+    <div class="panel" id="panel"></div>
+
+    <script>
+      const cues = {cues_json};
+      const playbackRate = {playback_rate};
+      const player = document.getElementById("player");
+      const panel = document.getElementById("panel");
+      const rateLabel = document.getElementById("rateLabel");
+
+      // 再生速度（HTMLAudioElementの機能）[4](https://huggingface.co/coqui/XTTS-v2)
+      player.playbackRate = playbackRate;
+      rateLabel.textContent = playbackRate.toFixed(1) + "x";
+
+      // 描画
+      panel.innerHTML = "";
+      cues.forEach((c, i) => {{
+        const span = document.createElement("span");
+        span.className = "word";
+        span.textContent = c.text;
+        span.dataset.i = i;
+        span.onclick = () => {{
+          player.currentTime = Math.max(0, Number(c.start) + 0.01);
+          player.play();
+          setActive(i);
+        }};
+        panel.appendChild(span);
+      }});
+
+      function setActive(i) {{
+        document.querySelectorAll(".word").forEach(el => el.classList.remove("active"));
+        const target = document.querySelector(`.word[data-i="${{i}}"]`);
+        if (target) target.classList.add("active");
+      }}
+
+      // 速くなるよう二分探索（cuesはstart昇順の想定）
+      function findIndex(t) {{
+        let lo = 0, hi = cues.length - 1;
+        while (lo <= hi) {{
+          const mid = (lo + hi) >> 1;
+          const c = cues[mid];
+          if (t < c.start) hi = mid - 1;
+          else if (t >= c.end) lo = mid + 1;
+          else return mid;
+        }}
+        // どれにも入らないときは直前を返す（自然な見た目）
+        return Math.max(0, Math.min(cues.length - 1, hi));
+      }}
+
+      player.addEventListener("timeupdate", () => {{
+        const idx = findIndex(player.currentTime);
+        setActive(idx);
+      }});
+
+      document.getElementById("play").onclick = () => player.play();
+      document.getElementById("pause").onclick = () => player.pause();
+      document.getElementById("stop").onclick = () => {{
+        player.pause();
+        player.currentTime = 0;
+        setActive(-1);
+      }};
     </script>
     """
-    components.html(html, height=80)
 
-st.info("Bの edge-tts は「Microsoft Edge のオンラインTTS」をPythonから利用する方式です（APIキー不要）。[1](https://pypi.org/project/edge-tts/)[2](https://github.com/rany2/edge-tts)")
-
+    # Streamlit側にも再生とDL（st.audioはbytes対応）[4](https://huggingface.co/coqui/XTTS-v2)
+    components.html(html, height=450, scrolling=True)
+    st.download_button("⬇️ MP3ダウンロード", mp3_bytes, file_name="tts_ja.mp3", mime="audio/mpeg")
