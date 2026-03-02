@@ -130,4 +130,4 @@ with colA:
     components.html(html, height=80)
 
 st.info("Bの edge-tts は「Microsoft Edge のオンラインTTS」をPythonから利用する方式です（APIキー不要）。[1](https://pypi.org/project/edge-tts/)[2](https://github.com/rany2/edge-tts)")
-``
+
